@@ -196,25 +196,33 @@ def get_or_build_tokenizer(config, ds, lang):
     return tokenizer
 
 
-def smart_batching(dataset, batch_size):
-    # Sort data by the length of source sentences
-    sorted_data = sorted(dataset, key=lambda x: len(x[0]))
+def collate_fn(batch):
+    encoder_inputs = [item['encoder_input'] for item in batch]
+    decoder_inputs = [item['decoder_input'] for item in batch]
+    labels = [item['label'] for item in batch]
     
-    # Create batches
-    batches = []
-    for i in range(0, len(sorted_data), batch_size):
-        batch = sorted_data[i:i + batch_size]
-        batches.append(batch)
+    encoder_inputs_padded = pad_sequence(encoder_inputs, batch_first=True, padding_value=0)  # Pad encoder inputs
+    decoder_inputs_padded = pad_sequence(decoder_inputs, batch_first=True, padding_value=0)  # Pad decoder inputs
+    labels_padded = pad_sequence(labels, batch_first=True, padding_value=0)  # Pad labels
     
-    return batches
+    # Expand dimensions for masks
+    encoder_mask = (encoder_inputs_padded != 0).unsqueeze(1).unsqueeze(1).int()  # Create encoder mask
+    decoder_mask = (decoder_inputs_padded != 0).unsqueeze(1).unsqueeze(1).int() & causal_mask(decoder_inputs_padded.size(1))  # Create decoder mask
+    
+    return {
+        "encoder_input": encoder_inputs_padded,
+        "decoder_input": decoder_inputs_padded,
+        "encoder_mask": encoder_mask,
+        "decoder_mask": decoder_mask,
+        "label": labels_padded,
+    }
+
 
 def get_ds(config):
-    
-    ds_raw = load_dataset('opus_books', f"{config['lang_src']}-{config['lang_tgt']}", split = 'train')  
+    ds_raw = load_dataset('opus_books', f"{config['lang_src']}-{config['lang_tgt']}", split='train')
     
     src_lang = config["lang_src"]
     tgt_lang = config["lang_tgt"]
-    seq_len = config["seq_len"]
     
     tokenizer_src = get_or_build_tokenizer(config, ds_raw, src_lang)
     tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, tgt_lang)
@@ -223,36 +231,23 @@ def get_ds(config):
     val_ds_size = len(ds_raw) - train_ds_size
     train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
     
-    train_ds = BillingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len)
-    val_ds = BillingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len)
+    train_ds = BillingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang)
+    val_ds = BillingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang)
     
-    max_len_src = 0
-    max_len_tgt = 0
+    max_len_src = max(len(tokenizer_src.encode(item['translation'][src_lang]).ids) for item in ds_raw)
+    max_len_tgt = max(len(tokenizer_tgt.encode(item['translation'][tgt_lang]).ids) for item in ds_raw)
     
-    for item in ds_raw:
-        src_ids = tokenizer_src.encode(item['translation'][src_lang]).ids
-        tgt_ids = tokenizer_tgt.encode(item['translation'][tgt_lang]).ids
-        max_len_src = max(max_len_src, len(src_ids))
-        max_len_tgt = max(max_len_tgt, len(tgt_ids))
+    print(f"Max length of the source sentence: {max_len_src}")
+    print(f"Max length of the target sentence: {max_len_tgt}")
     
-    print(f"Max length of the source sentence : {max_len_src}")
-    print(f"Max length of the source target : {max_len_tgt}")
-
-    train_data = [(torch.tensor(tokenizer_src.encode(item['translation'][src_lang]).ids[:seq_len]),
-                   torch.tensor(tokenizer_tgt.encode(item['translation'][tgt_lang]).ids[:seq_len]))
-                  for item in train_ds_raw]
-    val_data = [(torch.tensor(tokenizer_src.encode(item['translation'][src_lang]).ids[:seq_len]),
-                 torch.tensor(tokenizer_tgt.encode(item['translation'][tgt_lang]).ids[:seq_len]))
-                for item in val_ds_raw]
+    train_batches = smart_batching(train_ds, config["batch_size"])  # Smart batching for training data
+    val_batches = smart_batching(val_ds, 1)  # Smart batching for validation data
     
-    # Apply smart batching
-    train_batches = smart_batching(train_data, config["batch_size"])
-    val_batches = smart_batching(val_data, 1)
-    
-    train_dataloader = DataLoader(train_batches, batch_size = config["batch_size"], shuffle = True)
-    val_dataloader = DataLoader(train_batches, batch_size = 1, shuffle = True)
+    train_dataloader = DataLoader(train_batches, batch_size=None, collate_fn=collate_fn, shuffle=True)  # Train DataLoader
+    val_dataloader = DataLoader(val_batches, batch_size=None, collate_fn=collate_fn, shuffle=True)  # Validation DataLoader
     
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+
 
 
 def get_model(config, src_vocab_size, tgt_vocab_size):

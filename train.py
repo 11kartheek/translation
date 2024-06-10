@@ -1,14 +1,15 @@
 from model import build_transformer
-from dataset import BillingualDataset, causal_mask
+# from dataset import BillingualDataset, casual_mask
 from config_file import get_config, get_weights_file_path
 
 import torchtext.datasets as datasets
 import torch
 torch.cuda.amp.autocast(enabled = True)
-
+from torch.cuda.amp import autocast, GradScaler
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import OneCycleLR
 
 import warnings
 from tqdm import tqdm
@@ -32,6 +33,7 @@ from typing import Tuple, Optional, Callable
 
 import torch
 from torch.optim.optimizer import Optimizer
+
 
 class Lion(Optimizer):
   r"""Implements Lion algorithm."""

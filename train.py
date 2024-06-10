@@ -195,11 +195,6 @@ def get_or_build_tokenizer(config, ds, lang):
 
     return tokenizer
 
-def collate_fn(batch):
-    src_batch, tgt_batch = zip(*batch)
-    src_batch = pad_sequence(src_batch, batch_first=True, padding_value=0)
-    tgt_batch = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
-    return src_batch, tgt_batch
 
 def smart_batching(dataset, batch_size):
     # Sort data by the length of source sentences
@@ -209,7 +204,7 @@ def smart_batching(dataset, batch_size):
     batches = []
     for i in range(0, len(sorted_data), batch_size):
         batch = sorted_data[i:i + batch_size]
-        batches.append(collate_fn(batch))
+        batches.append(batch)
     
     return batches
 

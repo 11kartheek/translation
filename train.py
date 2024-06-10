@@ -33,12 +33,13 @@ from typing import Tuple, Optional, Callable
 
 import torch
 from torch.optim.optimizer import Optimizer
-
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.utils.rnn import pad_sequence
 
 class Lion(Optimizer):
   r"""Implements Lion algorithm."""
 
-  def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0001):
+  def __init__(self, params, lr=1e-4, betas=(0.95, 0.98), weight_decay=0.01):
     """Initialize the hyperparameters.
 
     Args:
@@ -283,8 +284,8 @@ def train_model(config):
     
     #Adam is used to train each feature with a different learning rate. 
     #If some feature is appearing less, adam takes care of it
-#     optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"])
-    optimizer = Lion(model.parameters(), lr = config["lr"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"])
+#     optimizer = Lion(model.parameters(), lr = config["lr"])
     scaler = GradScaler(enabled = True)
     initial_epoch = 0
     global_step = 0
@@ -300,7 +301,7 @@ def train_model(config):
         print("preloaded")
         
     loss_fn = nn.CrossEntropyLoss(ignore_index = tokenizer_src.token_to_id("[PAD]"), label_smoothing=0.1)
-    scheduler = OneCycleLR(optimizer, max_lr=1e-2, epochs=config["num_epochs"], steps_per_epoch=len(train_dataloader))
+    scheduler = OneCycleLR(optimizer, max_lr=1e-3, epochs=config["num_epochs"], steps_per_epoch=len(train_dataloader))
     
     for epoch in range(initial_epoch, config["num_epochs"]):
         torch.cuda.empty_cache()
@@ -332,7 +333,7 @@ def train_model(config):
 
             #Backpropogate loss
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -353,11 +354,5 @@ def train_model(config):
             model_filename
         )
 
-        
-            
-if __name__ == "__main__":
-    warnings.filterwarnings("ignore")
-    config = get_config()
-    train_model(config)
-    
+  
     

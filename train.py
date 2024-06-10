@@ -34,66 +34,73 @@ import torch
 from torch.optim.optimizer import Optimizer
 
 class Lion(Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-4,
-        betas: Tuple[float, float] = (0.9, 0.99),
-        weight_decay: float = 0.0,
-        use_triton: bool = False
-    ):
-        assert lr > 0.
-        assert all([0. <= beta <= 1. for beta in betas])
+  r"""Implements Lion algorithm."""
 
-        defaults = dict(
-            lr = lr,
-            betas = betas,
-            weight_decay = weight_decay
-        )
+  def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0001):
+    """Initialize the hyperparameters.
 
-        super().__init__(params, defaults)
+    Args:
+      params (iterable): iterable of parameters to optimize or dicts defining
+        parameter groups
+      lr (float, optional): learning rate (default: 1e-4)
+      betas (Tuple[float, float], optional): coefficients used for computing
+        running averages of gradient and its square (default: (0.9, 0.99))
+      weight_decay (float, optional): weight decay coefficient (default: 0)
+    """
 
-        self.update_fn = update_fn
+    if not 0.0 <= lr:
+      raise ValueError('Invalid learning rate: {}'.format(lr))
+    if not 0.0 <= betas[0] < 1.0:
+      raise ValueError('Invalid beta parameter at index 0: {}'.format(betas[0]))
+    if not 0.0 <= betas[1] < 1.0:
+      raise ValueError('Invalid beta parameter at index 1: {}'.format(betas[1]))
+    defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+    super().__init__(params, defaults)
 
-        if use_triton:
-            from lion_pytorch.triton import update_fn as triton_update_fn
-            self.update_fn = triton_update_fn
+  @torch.no_grad()
+  def step(self, closure=None):
+    """Performs a single optimization step.
 
-    @torch.no_grad()
-    def step(
-        self,
-        closure: Optional[Callable] = None
-    ):
+    Args:
+      closure (callable, optional): A closure that reevaluates the model
+        and returns the loss.
 
-        loss = None
-        if exists(closure):
-            with torch.enable_grad():
-                loss = closure()
+    Returns:
+      the loss.
+    """
+    loss = None
+    if closure is not None:
+      with torch.enable_grad():
+        loss = closure()
 
-        for group in self.param_groups:
-            for p in filter(lambda p: exists(p.grad), group['params']):
+    for group in self.param_groups:
+      for p in group['params']:
+        if p.grad is None:
+          continue
 
-                grad, lr, wd, beta1, beta2, state = p.grad, group['lr'], group['weight_decay'], *group['betas'], self.state[p]
+        # Perform stepweight decay
+        p.data.mul_(1 - group['lr'] * group['weight_decay'])
 
-                # init state - exponential moving average of gradient values
+        grad = p.grad
+        state = self.state[p]
+        # State initialization
+        if len(state) == 0:
+          # Exponential moving average of gradient values
+          state['exp_avg'] = torch.zeros_like(p)
 
-                if len(state) == 0:
-                    state['exp_avg'] = torch.zeros_like(p)
+        exp_avg = state['exp_avg']
+        beta1, beta2 = group['betas']
 
-                exp_avg = state['exp_avg']
+        # Weight update
+        update = exp_avg * beta1 + grad * (1 - beta1)
 
-                self.update_fn(
-                    p,
-                    grad,
-                    exp_avg,
-                    lr,
-                    wd,
-                    beta1,
-                    beta2
-                )
+        p.add_(update.sign_(), alpha=-group['lr'])
 
-        return loss
+        # Decay the momentum running average coefficient
+        exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
 
+    return loss
+      
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     
     
@@ -196,6 +203,11 @@ def get_or_build_tokenizer(config, ds, lang):
     return tokenizer
 
 
+def smart_batching(dataset, batch_size):
+    sorted_data = sorted(dataset, key=lambda x: len(x['encoder_input']))  # Sort by source sequence length
+    batches = [sorted_data[i:i + batch_size] for i in range(0, len(sorted_data), batch_size)]  # Create batches
+    return batches
+
 def collate_fn(batch):
     encoder_inputs = [item['encoder_input'] for item in batch]
     decoder_inputs = [item['decoder_input'] for item in batch]
@@ -216,6 +228,8 @@ def collate_fn(batch):
         "decoder_mask": decoder_mask,
         "label": labels_padded,
     }
+
+
 
 
 def get_ds(config):
@@ -249,7 +263,6 @@ def get_ds(config):
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
 
-
 def get_model(config, src_vocab_size, tgt_vocab_size):
     model = build_transformer(src_vocab_size, tgt_vocab_size, config["seq_len"], config["seq_len"], d_model=config['d_model'])
     return model
@@ -268,8 +281,9 @@ def train_model(config):
     
     #Adam is used to train each feature with a different learning rate. 
     #If some feature is appearing less, adam takes care of it
-    optimizer = Lion(model.parameters(), lr = config["lr"], eps = 1e-9)
-    
+#     optimizer = torch.optim.AdamW(model.parameters(), lr = config["lr"])
+    optimizer = Lion(model.parameters(), lr = config["lr"])
+    scaler = GradScaler(enabled = True)
     initial_epoch = 0
     global_step = 0
     
@@ -284,6 +298,7 @@ def train_model(config):
         print("preloaded")
         
     loss_fn = nn.CrossEntropyLoss(ignore_index = tokenizer_src.token_to_id("[PAD]"), label_smoothing=0.1)
+    scheduler = OneCycleLR(optimizer, max_lr=1e-2, epochs=config["num_epochs"], steps_per_epoch=len(train_dataloader))
     
     for epoch in range(initial_epoch, config["num_epochs"]):
         torch.cuda.empty_cache()
@@ -292,33 +307,35 @@ def train_model(config):
         batch_iterator = tqdm(train_dataloader, desc = f"Processing Epoch {epoch:02d}")
         
         for batch in batch_iterator:
-            encoder_input = batch["encoder_input"].to(device)
-            decoder_input = batch["decoder_input"].to(device)
-            encoder_mask = batch["encoder_mask"].to(device)
-            decoder_mask = batch["decoder_mask"].to(device)
-            
-            encoder_output = model.encode(encoder_input, encoder_mask)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-            proj_output = model.project(decoder_output)
-            
-            label = batch["label"].to(device)
-            
-            #Compute loss using cross entropy
-            tgt_vocab_size = tokenizer_tgt.get_vocab_size()
-            loss = loss_fn(proj_output.view(-1, tgt_vocab_size), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            with autocast():
+                encoder_input = batch["encoder_input"].to(device)
+                decoder_input = batch["decoder_input"].to(device)
+                encoder_mask = batch["encoder_mask"].to(device)
+                decoder_mask = batch["decoder_mask"].to(device)
 
-            #Log the loss
-            writer.add_scalar('train_loss', loss.item(), global_step)
-            writer.flush()
-            
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+                proj_output = model.project(decoder_output)
+
+                label = batch["label"].to(device)
+
+                #Compute loss using cross entropy
+                tgt_vocab_size = tokenizer_tgt.get_vocab_size()
+                loss = loss_fn(proj_output.view(-1, tgt_vocab_size), label.view(-1))
+                batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+
+                #Log the loss
+                writer.add_scalar('train_loss', loss.item(), global_step)
+                writer.flush()
+
             #Backpropogate loss
-            loss.backward()
-            
-            #Update weights
-            optimizer.step()
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            global_step+=1
+            global_step += 1
             
         #run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, writer, global_step)
         
@@ -333,6 +350,7 @@ def train_model(config):
             },
             model_filename
         )
+
         
             
 if __name__ == "__main__":

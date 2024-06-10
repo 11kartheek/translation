@@ -129,6 +129,23 @@ def get_or_build_tokenizer(config, ds, lang):
 
     return tokenizer
 
+def collate_fn(batch):
+    src_batch, tgt_batch = zip(*batch)
+    src_batch = pad_sequence(src_batch, batch_first=True, padding_value=0)
+    tgt_batch = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
+    return src_batch, tgt_batch
+
+def smart_batching(dataset, batch_size):
+    # Sort data by the length of source sentences
+    sorted_data = sorted(dataset, key=lambda x: len(x[0]))
+    
+    # Create batches
+    batches = []
+    for i in range(0, len(sorted_data), batch_size):
+        batch = sorted_data[i:i + batch_size]
+        batches.append(collate_fn(batch))
+    
+    return batches
 
 def get_ds(config):
     
@@ -159,9 +176,20 @@ def get_ds(config):
     
     print(f"Max length of the source sentence : {max_len_src}")
     print(f"Max length of the source target : {max_len_tgt}")
+
+    train_data = [(torch.tensor(tokenizer_src.encode(item['translation'][src_lang]).ids[:seq_len]),
+                   torch.tensor(tokenizer_tgt.encode(item['translation'][tgt_lang]).ids[:seq_len]))
+                  for item in train_ds_raw]
+    val_data = [(torch.tensor(tokenizer_src.encode(item['translation'][src_lang]).ids[:seq_len]),
+                 torch.tensor(tokenizer_tgt.encode(item['translation'][tgt_lang]).ids[:seq_len]))
+                for item in val_ds_raw]
     
-    train_dataloader = DataLoader(train_ds, batch_size = config["batch_size"], shuffle = True)
-    val_dataloader = DataLoader(val_ds, batch_size = 1, shuffle = True)
+    # Apply smart batching
+    train_batches = smart_batching(train_data, config["batch_size"])
+    val_batches = smart_batching(val_data, 1)
+    
+    train_dataloader = DataLoader(train_batches, batch_size = config["batch_size"], shuffle = True)
+    val_dataloader = DataLoader(train_batches, batch_size = 1, shuffle = True)
     
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
